@@ -1,0 +1,554 @@
+smart_bug_analysis: 
+  - text: |
+      I want to check whether there is any bug caused by further operation on unsafe variables after the specific callee is called. I have a static analysis tool designed to detect bugs in Windows kernel drivers. This tool has a high rate of false positives, which is a significant drawback due to its conservative analysis approach.
+      The tool tracks tainted data flows and flags the following types of potential memory-related vulnerabilities:
+      - **Null Pointer Dereference (NPD)**: A pointer check fails and calls the specific function, but the execution continues, and the pointer is directly dereferenced downstream (e.g., `*p = 0` or accessing a structural offset).
+      - **Buffer Overflow / Out-of-Bounds (BOF/OOB)**: A buffer length or array index check fails and triggers the specific function. However, the control flow falls through, and the unsafe length/index is subsequently used in array indexing or passed into critical memory sinks like `memcpy`, `memmove`, `RtlCopyMemory`, etc.
+      - **Reference Counting & Object Lifetime Issues**: The unhandled failure path allows execution to bypass proper object reference balance, leading to a premature release or missing cleanup, inducing Use-After-Free (UAF) or kernel pool leaks.
+        While these detections identify certain code patterns ("phenomena"), they don't necessarily correspond to actual security concerns, leading to many false positives. For instance, consider the following code (in ataport.sys): 
+      ```c
+      if ( *(_DWORD *)(a2 + 16) > 4u )
+      {{
+        callee()
+        *(_BYTE *)(a2 + 3) = 6;
+        return result;
+      }}
+      MappedBuffer = (_BYTE *)IdeGetMappedBuffer(a2);
+      ```
+      In this example, "a2" is flagged for using as a tainted variable within the comparison before the callee(). "a2" is also read at "*(_BYTE *)(a2 + 3)". However, sink "*(_BYTE *)(a2 + 3)"" is "SrbStatus" in "SRB", which is a safe operation, and the fail of the "if" check in " *(_DWORD *)(a2 + 16) > 4u" cannot lead to any potiental bugs.
+      However, (_BYTE *)(a2 + 3) may be a systembuffer if a2 is a PIRP, there would be a null pointer dereference bug, because read the buffer after the length check is unsafe.
+      Therefor, You should be careful about the meaning of pointers.
+      Note, in this case, read/store to "stauts" variables after callee() is safe. Otherwise, we need to think, is the tainted variable read/written can lead to any potiental bugs in all possible configurations/settings?
+      You can refer to the content in "structure inference" to infer whether there is a possible vulnerability.
+
+      **Your Task:**
+      1.	**Analysis Scope**: You will be provided with code snippets flagged by our static analysis tool.
+      2.  **Bug Logic Constraint**:
+        The comparison and callee can be on different branches than the sink. 
+        Our only concern is that because callee (I provide) didn't terminate the program flow, THEN can reach the sink point. Please check if the information I provided is the right order in any control flow(cmp -> callee -> sink). If not (e.g. sink is always before the callee within the control flow), then we assume **THERE IS NO BUG**.
+        The callee, compare and sink should be somewhat related to each other, you can check the distance between them , if the distance is too far (at least pass 50 lines of code after checking every control flow), then we assume **THERE IS NO BUG**.
+      3.	**Tainted Variable Assumption**: 
+        3.1 You may need to analyze separate field in the same structure with taint variable, you have to try to analyze the relation between different field.
+          For example:
+            checking the length of a struct, and dereference the buffer filed, may lead to null pointer dereference or call with memcpy/memmove etc. 
+        3.2 Assume any constraints or any existing checks are compromised and can be bypassed by the attacker.
+        3.3 This step is only concerned with the nature of the bug/vuln itself, which should be considered a real bug 
+          even though a potential check exists.
+          For example:
+          ```c
+          assert (tainted_var != Null);
+          *(tainted_var + 10h) = 0;
+          ```
+          In this case, even though there's an explicit check, 
+          we still need to mark the potential null pointer dereference as a "potential bug".
+          The analysis of whether the bug could really happen is NOT YOUR JOB. So just directly ignore any possible checks.
+        3.4 If the sink could be a potential bug, point out in what condition (e.g., the range of the tainted variable) it could be a bug.
+          For buffer overflow due to "memcpy", for example, `memcpy(dst, src, tainted_size) < 0`, 
+          its "bug condition" is "tainted_size > sizeof(dst)"
+      4. You should do the structure / variable analysis with the tainted variable, and recognize the read/write to a certain field of the variable is safe or not, e.g. you should always consider the read / write to iostatus is safe.
+      5. You can point out the out-of-bound access bug only if you can make sure the variable is a buffer, otherwise please don't consider out-of-bound access,
+        for example, if you cannot determind what the a1 is, *(a1 + 1000) is not a potential out-of-bound access bug.
+      6. You should analyze the ref count if you find functions like "_InterlockedExchangeAdd" in the context, and analyze the potential use-after-free or double-queue.
+      7.	**Objective**: For each code snippet, analyze it step by step to determine whether it represents:
+        7.1 **Potential Bug**: If the tainted variable usage can cause memory bug: out-of-bound access, buffer overflow                            
+              And the bug happens in the current context AFTER callee() is called, the bug control flow must through callee().
+              our sink is the FINAL SINK of the tainted data, it won't be used in other functions or contexts.
+              And only in this case, you can say it to be a "potential bug" and give your reasoning.
+        7.2 **Normal Code**: if the tainted variable usage cannot lead to a security issue, or the concern is out of our scope (loop, race)
+                 Please attribute it to be "normal code".
+      8. If the sink and comparison is basically the same (e.g. dereference at the same field of the variable), you shouldn't consider the null pointer dereference would occur.
+      9. When infering other fields that I don't provide, you should recover the pointer precisely with the information of structure inference I provided, for example, recover IRP structure and make further inference.
+        otherwise, if you have no enough knowledge about the field and pointer, you should not make a judgement.
+        When infering fields, you should notice the type of fields, for example, *(_BYTE *)(a2+3) is different with *(_QWORD)a1[3].
+      10. Far-out element of the variable (>1000 field bias) is not relable to consider a bug, for example:
+        the comparision about a2 + 8, however, the sink is (a2 + 2000), we consider it is not a bug.
+      11. You should use your basic knowledge of well-known functions, such as "_InterlockedExchangeAdd" while analyzing ref count etc.
+        
+      What We Need from You is a step-by-step explanation of how you arrived at "Normal Code" or "Potential Bug."
+      "arbitrary memory write" is not in our scope
+      Use these guidelines to systematically assess each snippet. If in doubt, lean toward marking something as a "Potential Bug," since at this stage we aim to avoid missing any plausible vulnerabilities.
+      ========================================
+      tainted_variable: {}
+      comparison: {} (line {})
+      specific callee: {} (line {})
+      sink: {} (line {})
+      driver file: {}
+      structure inference:
+      {}
+      disassembly code:
+      {}
+      ========================================
+    args:
+      - get_taint_variable
+      - get_cmp
+      - get_cmp_loc
+      - get_callee_code
+      - get_callee_code_loc
+      - get_sink
+      - get_sink_loc
+      - get_driver
+      - get_inference
+      - get_pseudocode_by_func
+  - text: |
+      Summarize our discussion, and respond in a <bug_eval> tag with the following format (vuln type + reason),
+      of course, one single tainted variable may lead multiple vulnerabilities:
+      currently we only consider (1) infinite/very-large loop, (2) out-of-bound access/buffer overflow/null pointer dereference (3) ref count problem;
+      for other types of bugs, you can say "normal code" or "not_a_bug"
+      <bug_eval>
+        <tainted_var>tainted_var</tainted_var>
+        <vulns>
+          <vuln>
+            <type> null pointer dereference </type>
+            <desc> the tainted_var can be Null and dereference</desc>
+            <bug_context> *(tainted_var+ 4) = 0 </bug_context>
+            <bug_condition> tainted_var is Null </bug_condition>
+          </vuln>
+        </vulns>
+      </bug_eval>
+      if it can't lead to a bug, you can say <bug_eval>not_a_bug</bug_eval>; 
+      rarely, you may say <bug_eval><vuln>uncertain</vuln></bug_eval> if some accidental conditions are met
+sanitizer_detection:
+  - text: |
+      I am doing the taint analysis in the Windows kernel; I have a static taint analysis tool that reports some 
+      warnings of tainted bugs, such as null pointer dereference or potential out-of-bound read/write. 
+
+      However, the warning could be a false positive because of the precision limitation of static analysis. 
+      A typical case is when the vulnerability is already sanitized before the sink; 
+      our static analysis is not path-sensitive, so it still warns us. 
+
+      At first, I want you could analyze any possible preconditions of the sink.
+      I want to analyze the possible vulnerbility through specific callee to the sink, so the analyzed control flow must flow through the specific callee.
+      Since we always assume the sink is reachable, these preconditions must be satisfied.
+
+      The analysis should be intra-procedural, i.e., if it calls another function, you can simply take a note
+      and no need to consider what happens in the function.
+
+      You're not always expected to give the final answer, if you think you need more information to finish your analysis, 
+      such as information of other functions, you can always ask me for their definition and continue your analysis
+      using the following format:
+
+      Note:
+      - you can request multiple <request> within only one <requests>, no same request in multiple requests, use <args> to list multiple arguments for one request
+      - please strictly follow the format of the requests, otherwise, I can't parse it
+
+      --- request 1: ask for the function definition ---
+      You could ask me for the definition of the function. in this case, you could respond with the following:
+      <requests>
+        <request>
+          <name>need_func_def</name>
+          <args>
+            <arg>func_1</arg>
+            <arg>func_2</arg>
+          </args>
+        </request>
+      </requests>
+      --- request 2: ask for the caller of the current function ---
+      You could ask me for the caller for the current function. (Note: you can only request one caller at a time)
+       in this case, you could respond with the following:
+       <requests>
+        <request>
+          <name>need_caller</name>
+          <args>
+            <arg>current_function_name</arg>
+          </args>
+        </request>
+      </requests>
+      ========================================
+
+      Before you start, you need to identify the sink of the function and the specific callee, which I will provide to you.
+      You're supposed to focus on the exact one single sink and the specific callee,
+      which I will provide the line numbers to you.
+
+      You should only consider the following two types of preconditions, essentially it's a reachability check:
+      - direct check (dominate condition)
+        for example, if we have 
+        ```c
+        a2 = 0xC0000000D
+        if (flag){{
+          sink(tainted_var);  
+        }}
+        ```
+      dominate condition can directly dominate the sink, so we need to consider it as a precondition.
+      - early return/bypass (guard condition)
+        Beyond this "direct check", we also need to consider the following "early return/bypass", for example:
+        ```c
+        a2 = 0xC0000000D
+        if (tainted_var > 100)
+          return/goto invalid_label;
+
+        sink(tainted_var);
+        ...
+        invalid_label:
+          return;
+        ```
+        here, the "invalid_label" is a "bypass" to the sink, so we need to consider it as a precondition of the sink:
+        so the precondition of the sink is "tainted_var <= 100" to make the sink reachable.
+
+      guard condition always have a early return or goto to skip the sink, 
+        for other checks but not directly related to the sink, we should ignore them, for example:
+      ```c
+      if (flag2)
+        do_something();
+      sink(tainted_var);
+      ```
+      here, the "flag2" can NOT guard our sink, so we should IGNORE it!
+      NOTICE:
+      The control flow must flow through the specific callee, and the preconditions to the specific callee are in our SCOPE!
+      for example:
+      ```c
+      if (flag3)
+        do_something();
+      callee()
+      if (flag4)
+        sink(tainted_var)
+      ```
+      here, "flag3" is a "bypass" to the callee(), so we need to consider it also as a precondition of the sink:
+
+      I hope you can work as a program verifier/symbolic execution engine to analyze the preconditions THROUGH THE callee() to the sink.
+      use our guidelines, and think line by line, and your first case is:
+
+      ========================================
+      specific callee:
+      {}
+      specific callee line number:
+      {}
+      sink context:
+      {}
+      sink line number:
+      {}
+      full decompilation code:
+      {}
+      ========================================
+
+      if you can't attribute a condition to "dominate condition" or "guard condition", you can ignore it.
+
+      after your analysis, you should summarize the preconditions of the sink in the following format:
+      ```xml
+      <sink_precondi>
+       <precondi>
+        <type> dominate_condition </type>
+        <condition> flag </condition>
+        <dominated_sink> if(flag) sink(tainted_var) </dominated_sink>
+       </precondi>
+       <precondi>
+        <type> guard_condition </type>
+        <condition> tainted_var <= 100 </condition>
+        <guard_bypass> if (tainted_var > 100) return/goto invalid_label; </guard_bypass>
+       </precondi>
+      </sink_precondi>
+      ```
+      Note: you can have multiple preconditions for the sink, and they can be combined with "AND" logic.
+    args:
+      - get_callee_code
+      - get_callee_code_loc
+      - get_sink
+      - get_sink_loc
+      - get_pseudocode_by_func
+    callback:
+      - need_func_def
+      - need_caller
+  - text: |
+      Next, please help me find if there are range constraints *for the tainted variable (include other fields)* along the call chain through specific callee to the sink(interprocedually). 
+      By default, I will provide the tainted variable, decompilation code, specific callee location and sink.
+      ========================================
+      tainted variable:
+      {}
+      specific callee context:
+      {}
+      specific callee line number:
+      {}
+      sink context:
+      {}
+      sink line number:
+      {}
+      full decompilation code:
+      {}
+      ========================================
+      You should be careful about the data flow of the tainted variable (include other fields) in the call chain cuz it may have different names in different contexts.
+
+      In this step, please consider every possible value range constraints that applies to the tainted variable (include other fields).
+      You are NOT expected to analyze whether the they really work (i.e., whether the bug is eliminated); just find them.
+
+      First of all, the detection must based on the function call chain through specific callee to the sink, rather than the your knowledge about the function definition.
+      As our target project is different from the version of the project you are familiar with.
+      Also, you can request for the definition of the function (see "request 1: ask for the function definition" below)
+
+      There's some knowledge for you to find the range constraints:
+      - There're essentially three types of constraints: 
+         a. Validation: reject invalid range, the tainted variable without expected range can't reach our sink,
+            e.g., if (tainted_var < 0) return -EINVAL; or, if (tainted_var > 0) go_to_our_sink();
+         b. Sanitization: correct the tainted value, the tainted variable can be corrected when it reaching our sink, 
+            e.g., tainted_var = min(tainted_var, 100);
+         c. type information. If a variable is an "unsigned integer," then it definitely>=0;
+            Also, a "uint8" can ensure the value is in the range [0, 255]. The type of information effectively limits the value range of the tainted variable.
+         d. prerequisites. If the tainted variable is dereference before the specific callee (even in comparison, if tainted variable is dereference); To make sure the control flow can reach the specific callee and sink,the tainted variable cannot be NUll, otherwise, the control flow cannot reach the specific callee and sink.
+            e.g. 
+            ```c
+            *tainted_var = 1; 
+            if(*(tainted_var+16) > 4) 
+              callee()
+              sink()
+            ```
+            In this case, tainted_var cannot be Null, otherwise specific callee and sink cannot be reached.
+      - transferability of the constraints: the constraints may not be directly applied to the tainted variable, 
+        but sometimes they can be transferred to the tainted variable through the function call chain. For example, Let's consdier `var = tainted_var + 1` 
+          a. the validation is transferable, which means, for example, `if (var < 0) return -EINVAL;` means 
+            `if (tainted_var + 1 < 0) return -EINVAL;`
+          b. the sanitzation is not transferable, which means, for example, `var = min(var, 100);` doesn't enforce 
+            the tainted value to be in the range [0, 99]
+      - if other field of the tainted variable have range constaints, these constraints are also in count to the tainted variable's range constraints
+      - In this step, you should only focus on the **detection** of the range constraints, no need for further analysis
+      - Be careful about the prerequisites constraints, you should't miss any one of them
+
+      If you think you need more information to finish your analysis, such as function definition, you should response with the following requests to get 
+      more information and I will provide them back to you to let you continue the analysis:
+      Note:
+        - you can request multiple <request> within only one <requests>, no same request in multiple requests, use <args> to list multiple arguments for one request
+        - please strictly follow the format of the requests, otherwise, I can't parse it
+      
+      --- request 1: ask for the function definition ---
+      You could ask me for the definition of the function. in this case, you could respond with the following:
+      <requests>
+        <request>
+          <name>need_func_def</name>
+          <args>
+            <arg>func_1</arg>
+            <arg>func_2</arg>
+          </args>
+        </request>
+      </requests>
+      --- request 2: ask for the caller of the current function ---
+      You could ask me for the caller for the current function. (Note: you can only request one caller at a time)
+       in this case, you could respond with the following:
+       <requests>
+        <request>
+          <name>need_caller</name>
+          <args>
+            <arg>current_function_name</arg>
+          </args>
+        </request>
+      </requests>
+      ---------------------------------------
+      After your finding, i.e., you already get enough information to finish your analysis,
+       you should add the range constraints you found in the following format at the end of your response,
+      the <type> is the type of the constraint, which can be "validation", "sanitization", "type_constraint" or "prerequisites"
+      the <handler_func> is the function that handles the constraint, and the <context> is the context of the source code showing how the constraint works
+      NOTE: NO NEED TO ANALYZE THE CONSTRAINTS, JUST COLLECT THEM, WE'LL ANALYZE THEM LATER
+      ---------------------------------------
+      <range_constraints>
+        <constraint>
+          <type>validation</type>
+          <handler_func>func_1</handler_func>
+          <context>the_context_of_the_constraint</context>
+        </constraint>
+      </range_constraints>
+      ---------------------------------------
+      To save tokens and time, let's remove the range constraints if its "constrained_var" is clearly not relevant to our tainted variable.
+    args:
+      - get_taint_variable
+      - get_callee_code
+      - get_callee_code_loc
+      - get_sink
+      - get_sink_loc
+      - get_pseudocode_by_func
+    callback:
+      - need_func_def
+      - need_caller
+  - text: |
+      First of all, you're no need to finish the task at very first, you can always ask for more information:
+      you should ask for more information by using the following format. In this case, you shouldn't
+      reach a conclusion, ask me for more information to help you, so you can analyze again 
+      once you get the information you need back from me.
+      --- request 1: ask for the function definition ---
+      You could ask me for the definition of the function. in this case, you could respond with the following:
+      <requests>
+        <request>
+          <name>need_func_def</name>
+          <args>
+            <arg>func_1</arg>
+            <arg>func_2</arg>
+          </args>
+        </request>
+      </requests>
+      --- request 2: ask for the caller of the current function ---
+      You could ask me for the caller for the current function. (Note: you can only request one caller at a time)
+       in this case, you could respond with the following:
+       <requests>
+        <request>
+          <name>need_caller</name>
+          <args>
+            <arg>current_function_name</arg>
+          </args>
+        </request>
+      </requests>
+      ========================================
+      
+      Now it's time to look back to these possible range constraints you just found and analyze their preconditions 
+        and postconditions.
+      In this step, I want you can work as a program verifier/symblic execution engine,
+      to infer the precondition and postcondition of these constraints.
+
+      IMPORTANT: We focus on the specific callee related code, so you should only analyze the control flow through the specific callee path to the sink path, preconditions or postconditions in other control flow path are not in our scope.
+      We can apply simple rules to analyze the precondition and postcondition of the constraints:
+        - The precondition is the path-condition to make the constraint reachable, and the postcondition is the effect of the constraint on the tainted variable
+        - The precondition should be an expression of variables, and the postcondition should be a range of the tainted variable
+        - For example, `if(config) constraint(x);`
+          we must consider both branches are possible to reach
+            for example, if we have the following code:
+            ```c
+            void check_tainted_value(int config, int other_config, int x){{
+              if (other_config == CHECK_SKIP)
+                return;
+              if (config == 1)
+                assert(x > 0 && x < 100);
+              else if (config == 2)
+                assert(x > 0);
+            }}
+            ```
+            there are actually **following** [precondition, postcondition] pairs:
+            - [other_config == CHECK_SKIP, x in (-inf, +inf)]
+            - [other_config != CHECK_SKIP && config == 1, x in (0, 100)]
+            - [other_config != CHECK_SKIP && config == 2, x in (0, +inf)]
+            - [other_config != CHECK_SKIP && config != 1 && config != 2, x in (-inf, +inf)]
+          The most notable thing is that we have to consider every possible "early return" in the function,
+          i.e, the "other_config == CHECK_SKIP" in this case. It can bypass the following constraints.
+          So we have to add "other_config != CHECK_SKIP" as a precondition of the constraint.
+        - You should pay more attention to the "bypass" of our constraint
+          A typical bypass is like:
+          "`c
+          if (some_other_condition)
+            return do_other_thing(tainted_var);
+
+          assert(tainted_var < 100)
+          ```
+          In this case, there's constraint ("assert") tries to limit the range of the tainted variable, 
+            but the other branch, "some_other_condition"
+           might bypass the check w/o reaching our constraint. Therfore, the precondition is, so far, "!some_other_condition",
+           it means, to make the constraint reachable, the "some_other_condition" should be false.
+
+      After your finding, i.e., you have enough information about the entire project code to finish your analysis,
+      NOTE: the preconditions are always path constraint! NEVER SAY "something must executed successfully" or "something must be true",
+        you should always use the statement inside the "if" statement to describe the precondition
+      you should add the preconditions and postconditions you found in the following format at the end of your response:
+         ```xml
+        <conA>
+          <range_constraint>
+            <type>validation</type>
+            <handler_func>check_tainted_value</handler_func>
+            <condition_pairs>
+            <pair>
+              <precondi>other_config == CHECK_SKIP</precondi>
+              <postcondi>x in (-inf, +inf)</postcondi>
+              <context> if (other_config == CHECK_SKIP) return; </context>
+            </pair>
+            <pair>
+              <precondi>other_config != CHECK_SKIP && config == 1</precondi>
+              <postcondi>x in (0, 100)</postcondi>
+              <context> if (config == 1) assert(x > 0) && (x < 100); </context>
+            </pair>
+            <pair>
+              <precondi>other_config != CHECK_SKIP && config == 2</precondi>
+              <postcondi>x in (0, +inf)</postcondi>
+              <context> else if (config == 2) assert(x > 0); </context>
+            </pair>
+            <pair>
+              <precondi>other_config != CHECK_SKIP && config != 1 && config != 2</precondi>
+              <postcondi>x in (-inf, +inf)</postcondi>
+              <context> induced by the other branches </context>
+            </pair>
+            </condition_pairs>
+          </range_constraint>
+        </conA>
+        ````
+    args:
+      - get_analysis_result
+    callback:
+      - need_func_def
+      - need_caller
+    record:
+      - conA
+  - text: |
+      First of all, you're no need to finish the task at very first, you can always ask for more information:
+      you should ask for more information by using the following format. In this case, you shouldn't
+      reach a conclusion, ask me for more information to help you, so you can analyze again 
+      once you get the information you need back from me.
+      --- request 1: ask for the function definition ---
+      You could ask me for the definition of the function. in this case, you could respond with the following:
+      <requests>
+        <request>
+          <name>need_func_def</name>
+          <args>
+            <arg>func_1</arg>
+            <arg>func_2</arg>
+          </args>
+        </request>
+      </requests>
+      --- request 2: ask for the caller of the current function ---
+      You could ask me for the caller for the current function. (Note: you can only request one caller at a time)
+       in this case, you could respond with the following:
+       <requests>
+        <request>
+          <name>need_caller</name>
+          <args>
+            <arg>current_function_name</arg>
+          </args>
+        </request>
+      </requests>
+      ========================================
+
+      The task is to distinguish this potential bug to see if it is eliminated, not exploitable, or still a potential vulnerability.
+
+      We need to discuss about whether the "bug condition" can be satisified, by considering all its constraints we found.
+      specifically, we should take the following steps very carefully, step by step, to understand the effect of the range_constraints,
+      you may need to write down the intermediate results for every step to help you make the final decision:
+        - remove constraints whose postcondition is not a range to the taint (include other fields);
+        - remove constraints whose postcondition limits the variable that represents another sink but not the sink we are analyzing
+
+      If and only if the postcondition of these range constraints ensures that the exact tainted variable is sanitized with a safe range, i.e., 
+        The "bug" won't happen in any value it can take, then we can conclude the bug is eliminated.
+
+      Again, "eliminated" requires a very strong postcondition and precondition, it requires to have a raneg constraint that:
+        - the postcondition effectively limits the tainted variable to a safe range, making the bug **impossible** to happen
+        - the precondition is always satified:
+          - the precondition is always true
+          - the precondition must hold if "the precondition of the sink" is true
+
+      If the postcondition is not strong enough, we need to see the context of the sink and analyze whether the bug is exploitable.
+        Again, you can assume the hacker can set any value to the tainted variable
+
+      IMPORTANT: We focus on the specific callee related code, so you should only analyze the control flow through the specific callee setting path to the sink path, preconditions or postconditions in other control flow path are not in our scope.
+      you should check the vulnerbilities in conA, and check whether these vulnerbilities are exist
+    
+      ========================================
+      vuln: 
+      {}
+      full decompilation code:
+      {}
+      ========================================
+      You should recheck the potiental vulnerbility in "conA", and check whether the vulnerability is still exist.
+      After you finalize the analysis, i.e., you have enough information about the entire project code to finish your analysis,
+      you should update the result in our format.
+    args:
+      - get_analysis_result
+      - get_pseudocode_by_func
+    callback:
+      - need_func_def
+      - need_caller
+  - text: |
+      Please reconsider the vulnerbility in "conA" is still exist or not with the result in sanitizer detection
+      Great! Now Let's summarize our discussion, and respond in a <final_res> tag with the following format:
+      "still_a_bug", "eliminated", "likely_safe", "likely_unsafe", "not_exploitable" or "uncertain" within a <final_res> tag, 
+      Additionally, you should point out which bug if the conclusion is "still_a_bug".
+      e.g., 
+      <final_res>
+        still_a_bug
+        <bug>
+          null pointer dereference
+        </bug>
+        <bug>
+          buffer overflow
+        </bug>
+      </final_res>
+    record:
+      - conclusion
+     
